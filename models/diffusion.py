@@ -14,7 +14,6 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
-
 class SinusoidalPositionEmbedding(nn.Module):
     """
     Encodes the diffusion timestep as a sinusoidal embedding.
@@ -41,9 +40,9 @@ class ResBlock(nn.Module):
     def __init__(self, in_ch, out_ch, time_emb_dim):
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.bn1 = nn.GroupNorm(8, out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.bn2 = nn.GroupNorm(8, out_ch)
         self.time_mlp = nn.Linear(time_emb_dim, out_ch)
 
         if in_ch != out_ch:
@@ -154,10 +153,21 @@ class DiffusionModel:
         self.num_timesteps = num_timesteps
         self.image_size = image_size
         self.in_channels = in_channels
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+
+        # Ensure that the total amount of noise added remains consistent 
+        # even if num_timesteps is changed from the default 1000.
+        # If we don't scale it, at T=200 it won't reach pure noise!
+        scale = 1000.0 / num_timesteps
+        beta_end_scaled = beta_end * scale
 
         # Linear noise schedule
-        self.betas = torch.linspace(beta_start, beta_end, num_timesteps).to(self.device)
+        self.betas = torch.linspace(beta_start, beta_end_scaled, num_timesteps).to(self.device)
         self.alphas = 1.0 - self.betas
         self.alpha_cumprod = torch.cumprod(self.alphas, dim=0)
         self.alpha_cumprod_prev = F.pad(self.alpha_cumprod[:-1], (1, 0), value=1.0)
@@ -203,7 +213,8 @@ class DiffusionModel:
             list of (timestep, image_numpy) tuples
         """
         x_0 = x_0.to(self.device)
-        results = [(0, x_0.squeeze(0).cpu().permute(1, 2, 0).numpy())]
+        x_0 = x_0 * 2.0 - 1.0  # Scale [0, 1] to [-1, 1]
+        results = [(0, ((x_0 + 1.0) / 2.0).squeeze(0).cpu().permute(1, 2, 0).numpy())]
 
         timesteps = np.linspace(0, self.num_timesteps - 1, num_steps, dtype=int)
 
@@ -212,6 +223,7 @@ class DiffusionModel:
                 t = torch.tensor([t_val]).long().to(self.device)
                 x_t, _ = self.forward_process(x_0, t)
                 img = x_t.squeeze(0).cpu().permute(1, 2, 0).numpy()
+                img = (img + 1.0) / 2.0  # Scale [-1, 1] back to [0, 1]
                 img = np.clip(img, 0, 1)
                 results.append((t_val, img))
 
@@ -221,6 +233,14 @@ class DiffusionModel:
         """Single training step: predict the noise added to x_0."""
         self.model.train()
         x_0 = x_0.to(self.device)
+        
+        # Scale to [-1, 1] for diffusion
+        x_0 = x_0 * 2.0 - 1.0
+        
+        # We simulate a "batch" of identical images to allow the model to see different 
+        # timesteps in a single optimization step, which is crucial for convergence.
+        batch_size = 16
+        x_0 = x_0.repeat(batch_size, 1, 1, 1)
 
         # Sample random timestep
         t = torch.randint(0, self.num_timesteps, (x_0.shape[0],)).long().to(self.device)
@@ -285,12 +305,15 @@ class DiffusionModel:
             # Save intermediate steps for visualization
             if t % (self.num_timesteps // 10) == 0 or t == 0:
                 img = x.squeeze(0).cpu().permute(1, 2, 0).numpy()
+                img = (img + 1.0) / 2.0  # Scale back to [0, 1] from [-1, 1]
                 img = np.clip(img, 0, 1)
                 intermediates.append((t, img))
 
             if progress_callback:
                 progress_callback(self.num_timesteps - t, self.num_timesteps)
-
+        
+        # Final image to [0, 1]
+        x = (x + 1.0) / 2.0
         return x, intermediates
 
     def train_on_image(self, image_tensor, num_epochs=500, lr=0.001, progress_callback=None):

@@ -160,7 +160,12 @@ def train_vae_on_image(image_tensor, latent_dim=128, num_epochs=300, lr=0.001,
         model: trained VAE model
         history: list of loss dictionaries per epoch
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
     channels = image_tensor.shape[1]
     image_size = image_tensor.shape[2]
